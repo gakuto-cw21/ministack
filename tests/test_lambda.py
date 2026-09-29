@@ -7549,7 +7549,7 @@ def test_lambda_invoke_emits_cloudwatch_logs_nodejs(lam, logs):
 # ──────────────────── host.docker.internal → host-gateway ────────────────────
 
 
-def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
+def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_overrides=None):
     """Spawn one Lambda container against fakes and return the docker kwargs.
 
     Captures both entry points: the DinD path uses ``containers.create`` (code
@@ -7574,14 +7574,37 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags=""):
     fake_client.images.get = MagicMock()
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
 
-    lsvc._spawn_lambda_container(
-        {"FunctionName": "test-hg-fn", "Runtime": "python3.12",
-         "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
-         "MemorySize": 128,
-         "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn"},
-        _make_zip("def handler(e, c): pass"),
-    )
+    config = {
+        "FunctionName": "test-hg-fn", "Runtime": "python3.12",
+        "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+        "MemorySize": 128,
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:test-hg-fn",
+    }
+    config.update(config_overrides or {})
+    lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
     return captured
+
+
+@pytest.mark.parametrize("timeout", [3, 301, 900])
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("in_container", [False, True])
+def test_lambda_container_passes_configured_timeout_to_rie(monkeypatch, timeout, package_type, in_container):
+    """RIE reads AWS_LAMBDA_FUNCTION_TIMEOUT, otherwise it defaults to 300s (#1844)."""
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: in_container)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566",
+        config_overrides={
+            "Timeout": timeout,
+            "PackageType": package_type,
+            "ImageUri": "public.ecr.aws/lambda/python:3.12",
+            "Environment": {"Variables": {
+                "AWS_LAMBDA_FUNCTION_TIMEOUT": "1",
+                "_LAMBDA_TIMEOUT": "1",
+            }},
+        },
+    )
+    assert captured["environment"]["AWS_LAMBDA_FUNCTION_TIMEOUT"] == str(timeout)
+    assert captured["environment"]["_LAMBDA_TIMEOUT"] == str(timeout)
 
 
 def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
@@ -10774,6 +10797,32 @@ def test_lambda_invoke_returns_a_rie_init_error_to_the_caller(monkeypatch):
     assert status == 200
     assert headers["X-Amz-Function-Error"] == "Unhandled"
     assert json.loads(body)["errorType"] == "Runtime.ImportModuleError"
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
+def test_lambda_docker_rie_uses_configured_deadline(lam):
+    """Check the real RIE deadline without waiting for its old 300s limit (#1844)."""
+    fname = f"lam-rie-deadline-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=900,
+        Code={"ZipFile": _make_zip(
+            "def handler(event, context):\n"
+            "    return {'remaining_ms': context.get_remaining_time_in_millis()}\n"
+        )},
+    )
+    try:
+        # Both cold and warm invocations must receive the configured deadline.
+        for _ in range(2):
+            resp, payload = _invoke_lambda_payload(lam, fname, {})
+            assert not resp.get("FunctionError"), payload
+            assert 850_000 < payload["remaining_ms"] <= 900_000, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
 
 
 @pytest.mark.skipif(

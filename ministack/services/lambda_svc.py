@@ -341,6 +341,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_SESSION_TOKEN",
     "AWS_LAMBDA_FUNCTION_NAME",
     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_TIMEOUT",
     "AWS_LAMBDA_FUNCTION_VERSION",
     "AWS_LAMBDA_LOG_STREAM_NAME",
     "AWS_LAMBDA_RUNTIME_API",
@@ -4385,6 +4386,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
+        # AWS RIE uses this name and otherwise limits invocations to 300s.
+        "AWS_LAMBDA_FUNCTION_TIMEOUT": str(timeout),
     }
     container_env.update(execution_credentials(config))
     if is_provided:

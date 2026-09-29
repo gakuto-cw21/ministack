@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early (#1844).
+
 ## [1.5.18] — 2026-09-28
 
 ### Added
