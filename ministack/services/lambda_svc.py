@@ -2893,7 +2893,7 @@ def _update_config(name: str, data: dict):
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
     # AWS-match: UpdateFunctionConfiguration recycles the init container when
-    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # spawn-time inputs change (Runtime/Handler/Timeout/Layers/Env/MemorySize/Arch/
     # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
     # account:func:qualifier, so a stale worker would keep serving with the
     # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
@@ -2901,7 +2901,7 @@ def _update_config(name: str, data: dict):
     # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
     # worker without the new layer extracted on disk (issue #816).
     _WORKER_AFFECTING = {
-        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Runtime", "Handler", "Timeout", "Layers", "Environment", "MemorySize",
         "Architectures", "VpcConfig", "FileSystemConfigs",
     }
     if any(k in data for k in _WORKER_AFFECTING):

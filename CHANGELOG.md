@@ -9,7 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early (#1844).
+- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early. Timeout updates recycle warm containers so the RIE deadline follows the new configuration (#1844).
 
 ## [1.5.18] — 2026-09-28
 

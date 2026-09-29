@@ -7607,6 +7607,35 @@ def test_lambda_container_passes_configured_timeout_to_rie(monkeypatch, timeout,
     assert captured["environment"]["_LAMBDA_TIMEOUT"] == str(timeout)
 
 
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_timeout_update_evicts_warm_container(monkeypatch, package_type, old_timeout, new_timeout):
+    """A warm RIE container must not keep its previous invocation deadline."""
+    name = f"lam-timeout-update-{_uuid_mod.uuid4().hex[:8]}"
+    config = {
+        "FunctionName": name, "Timeout": old_timeout, "PackageType": package_type,
+        "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{name}",
+        "ImageUri": "public.ecr.aws/lambda/python:3.12",
+    }
+    monkeypatch.setattr(lsvc, "_functions", {name: {"config": config}})
+    monkeypatch.setattr(lsvc, "invalidate_worker", Mock())
+    monkeypatch.setattr(lsvc, "_schedule_state_transition", Mock())
+    key = lsvc._warm_pool_key(name, config)
+    container = _mk_container()
+    entry = lsvc._pool_register(key, container, None)
+    lsvc._pool_release(entry)
+
+    response = lsvc._update_config(name, {"Timeout": new_timeout})
+
+    assert response[0] == 200
+    assert config["Timeout"] == new_timeout
+    acquired, reason = lsvc._pool_acquire(key, max_concurrency=None)
+    assert acquired is None
+    assert reason == "spawn"
+    container.stop.assert_called_once()
+    container.remove.assert_called_once()
+
+
 def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch):
     """A container pointed at host.docker.internal gets the name mapped.
 
@@ -10830,6 +10859,45 @@ def test_lambda_docker_rie_uses_configured_deadline(lam):
     reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
 )
 @pytest.mark.data_plane
+@pytest.mark.parametrize("old_timeout,new_timeout", [(3, 10), (10, 3)])
+def test_lambda_docker_timeout_update_changes_rie_deadline(lam, old_timeout, new_timeout):
+    """Timeout updates replace the warm container and reach the real RIE."""
+    fname = f"lam-rie-update-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Handler="index.handler",
+        Role=_LAMBDA_ROLE, Timeout=old_timeout,
+        Code={"ZipFile": _make_zip(
+            "import time\n"
+            "def handler(event, context):\n"
+            "    remaining = context.get_remaining_time_in_millis()\n"
+            "    time.sleep(event.get('sleep', 0))\n"
+            "    return {'remaining_ms': remaining, 'ok': True}\n"
+        )},
+    )
+    try:
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert payload["ok"] is True
+        lam.update_function_configuration(FunctionName=fname, Timeout=new_timeout)
+        lam.get_waiter("function_updated_v2").wait(
+            FunctionName=fname, WaiterConfig={"Delay": 1, "MaxAttempts": 10},
+        )
+        resp, payload = _invoke_lambda_payload(lam, fname, {})
+        assert not resp.get("FunctionError"), payload
+        assert new_timeout * 500 < payload["remaining_ms"] <= new_timeout * 1000, payload
+        if new_timeout > old_timeout:
+            resp, payload = _invoke_lambda_payload(lam, fname, {"sleep": old_timeout + 1})
+            assert not resp.get("FunctionError"), payload
+            assert isinstance(payload, dict) and payload.get("ok") is True, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.data_plane
 def test_lambda_docker_timeout_returns_task_timed_out_promptly(lam):
     """The real RIE end of the timeout story: one AWS-style error, promptly.
 
@@ -13704,7 +13772,7 @@ def test_provided_env_uses_execution_role_credentials(monkeypatch):
     assert {key: env[key] for key in credentials} == credentials
 
 
-@pytest.mark.parametrize("operation", ["code", "configuration", "delete"])
+@pytest.mark.parametrize("operation", ["code", "configuration", "timeout", "delete"])
 def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool, operation):
     config = _provided_dispatch_config()
     name = config["FunctionName"]
@@ -13720,6 +13788,8 @@ def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool
         result = lambda_svc._update_code(name, {})
     elif operation == "configuration":
         result = lambda_svc._update_config(name, {"Environment": {"Variables": {"UPDATED": "yes"}}})
+    elif operation == "timeout":
+        result = lambda_svc._update_config(name, {"Timeout": config["Timeout"] + 1})
     else:
         result = lambda_svc._delete_function(name, {})
     assert result[0] in (200, 204)
