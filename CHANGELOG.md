@@ -17,6 +17,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — invocation IDs and Docker logs** — one request ID is propagated to Docker RIE, warm/local Python and Node.js, and provided runtimes. RIE output is identified by executor metadata and saved without a second START / END / REPORT sequence. Other executors and empty RIE output retain synthetic platform logs.
 - **Lambda — preserve invocation aliases in runtime context** — `Invoke` retains the requested alias or version in `invoked_function_arn`, while `function_version` remains the resolved published version. Warm workers receive invocation identity per request. Contributed by @jayjanssen.
 - **IoT — `DescribeCertificate` reports `certificateMode`** — the field was missing from the description. It is now `SNI_ONLY` for a certificate registered with `RegisterCertificateWithoutCA` and `DEFAULT` for the others, as AWS reports it. Contributed by @iot-rocket.
 ### Fixed
