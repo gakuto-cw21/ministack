@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lambda — local Node.js console logs** — the one-shot local executor mixed `console.log()`, `console.info()` and other stdout output into the Invoke response, and omitted them from invocation logs. It now sends handler stdout/stderr output, including `fs.writeSync(1, ...)` and `fs.write(1, ...)`, to the log channel and reserves stdout for the JSON return value, including logs written during module initialization.
+
 ## [1.5.23] — 2026-10-07
 
 ### Added

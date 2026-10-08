@@ -889,6 +889,16 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 
+// Reserve stdout for the Invoke payload, including during module initialization.
+const realStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = process.stderr.write.bind(process.stderr);
+// Direct fd writes also belong to the log channel (e.g. pino).
+const realWriteSync = fs.writeSync.bind(fs);
+const realWrite = fs.write.bind(fs);
+fs.writeSync = (fd, ...args) => realWriteSync(fd === 1 ? 2 : fd, ...args);
+fs.write = (fd, ...args) => realWrite(fd === 1 ? 2 : fd, ...args);
+require('module').syncBuiltinESMExports();
+
 const codeDir = process.env._LAMBDA_CODE_DIR || '/var/task';
 const modPath  = process.env._LAMBDA_HANDLER_MODULE;
 const fnName   = process.env._LAMBDA_HANDLER_FUNC;
@@ -945,7 +955,7 @@ process.stdin.on('end', async () => {
     process.exit(1);
   }
   Promise.resolve(handler(event, context)).then(result => {
-    if (result !== undefined) process.stdout.write(JSON.stringify(result));
+    if (result !== undefined) realStdoutWrite(JSON.stringify(result));
   }).catch(err => {
     process.stderr.write(String(err.stack || err));
     process.exit(1);
