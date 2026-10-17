@@ -1519,10 +1519,6 @@ def _gateway_error_response(error, request):
     if customized is None:
         # A deployment restored from state written before snapshots existed.
         customized = _gateway_responses.get(api_id, {})
-    if isinstance(error, _PlainGatewayError) and not customized.keys() & {
-        error.response_type, _gateway_response_family(error.response_type)
-    }:
-        return error.response
     response_type = error.response_type
     response = _gateway_response_for_type(customized, response_type)
     template = (response.get("responseTemplates") or {}).get("application/json")
@@ -1844,16 +1840,6 @@ def _token_scopes(claims):
     return sorted(set(scopes))
 
 
-class _PlainGatewayError(_GatewayError):
-    """A gateway error whose built-in default was not measured against AWS: it
-    keeps the response it had before gateway responses were applied, while a
-    customized response for its type still takes over."""
-
-    def __init__(self, response_type, message, response):
-        super().__init__(response_type, message)
-        self.response = response
-
-
 async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_params, stage):
     """Verify a user-pool token for a COGNITO_USER_POOLS method.
 
@@ -1918,8 +1904,7 @@ async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_pa
     if required_scopes:
         granted = _token_scopes(claims)
         if not any(scope in granted for scope in required_scopes):
-            forbidden = (403, {"Content-Type": "application/json"}, json.dumps({"message": "Forbidden"}).encode())
-            return None, _PlainGatewayError("ACCESS_DENIED", "Forbidden", forbidden)
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     return claims, None
 

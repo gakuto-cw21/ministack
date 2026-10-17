@@ -4781,14 +4781,119 @@ def test_apigwv1_cognito_authorization_scopes(apigw_v1, lam, cognito_idp):
         base = {"sub": "u1", "iss": issuer, "iat": now, "exp": now + 3600}
 
         assert _call(_v1_signed_token({**base, "scope": "files/read files/write"})) == 200
-        # A token whose scopes do not overlap is authenticated but not authorized.
-        assert _call(_v1_signed_token({**base, "scope": "other/scope"})) == 403
-        assert _auth_http(url, headers={"Host": host, "Authorization": _v1_signed_token({**base, "scope": "other/scope"})})[1] == b'{"message": "Forbidden"}'
+        # AWS documents 401 when none of the method's OAuth scopes match.
+        assert _call(_v1_signed_token({**base, "scope": "other/scope"})) == 401
+        assert json.loads(_auth_http(url, headers={"Host": host, "Authorization": _v1_signed_token({**base, "scope": "other/scope"})})[1]) == {"message": "Unauthorized"}
         # An ID token carries no scopes at all, so it can never satisfy one.
-        assert _call(_v1_signed_token({**base, "token_use": "id", "aud": "c1"})) == 403
+        assert _call(_v1_signed_token({**base, "token_use": "id", "aud": "c1"})) == 401
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+@pytest.mark.parametrize("basic", [False, True])
+def test_apigwv1_cognito_client_credentials_http(apigw_v1, cognito_idp, basic):
+    """Real token endpoint -> REST Cognito authorizer, including OAuth refusals."""
+    import base64
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlencode
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    pool = cognito_idp.create_user_pool(PoolName=f"m2m-rest-{suffix}")["UserPool"]
+    pool_id = pool["Id"]
+    api_id = apigw_v1.create_rest_api(name=f"m2m-rest-{suffix}")["id"]
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=f"m2m-rest-{suffix}")
+        cognito_idp.create_resource_server(
+            UserPoolId=pool_id, Identifier="api", Name="api",
+            Scopes=[{"ScopeName": s, "ScopeDescription": s} for s in ("read", "write", "admin")],
+        )
+        client = cognito_idp.create_user_pool_client(
+            UserPoolId=pool_id, ClientName="m2m", GenerateSecret=True,
+            AllowedOAuthFlowsUserPoolClient=True, AllowedOAuthFlows=["client_credentials"],
+            AllowedOAuthScopes=["api/read", "api/write"],
+        )["UserPoolClient"]
+        authorizer = apigw_v1.create_authorizer(
+            restApiId=api_id, name="pool", type="COGNITO_USER_POOLS", providerARNs=[pool["Arn"]],
+            identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+        )
+        root_id = _auth_root_id(apigw_v1, api_id)
+        args = dict(restApiId=api_id, resourceId=root_id, httpMethod="GET")
+        apigw_v1.put_method(**args, authorizationType="COGNITO_USER_POOLS", authorizerId=authorizer["id"],
+                            authorizationScopes=["api/read", "api/admin"])
+        apigw_v1.put_integration(**args, type="MOCK", requestTemplates={"application/json": '{"statusCode":200}'})
+        apigw_v1.put_method_response(**args, statusCode="200")
+        apigw_v1.put_integration_response(**args, statusCode="200", responseTemplates={"application/json": '{"ok":true}'})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="dev")
+        assert apigw_v1.get_method(**args)["authorizationScopes"] == ["api/read", "api/admin"]
+
+        def get_token(scope):
+            form = {"grant_type": "client_credentials"}
+            if scope is not None:
+                form["scope"] = scope
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if basic:
+                credentials = base64.b64encode(f"{client['ClientId']}:{client['ClientSecret']}".encode()).decode()
+                headers["Authorization"] = f"Basic {credentials}"
+            else:
+                form.update(client_id=client["ClientId"], client_secret=client["ClientSecret"])
+            request = urllib.request.Request(f"{_endpoint}/oauth2/token", data=urlencode(form).encode(), headers=headers)
+            try:
+                response = urllib.request.urlopen(request, timeout=30)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                return response.status, json.loads(response.read())
+
+        def call(token=None):
+            headers = {"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"}
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
+            request = urllib.request.Request(f"{_endpoint}/dev/", headers=headers)
+            try:
+                response = urllib.request.urlopen(request, timeout=30)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                return response.status, json.loads(response.read()), {k.lower(): v for k, v in response.headers.items()}
+
+        for scope in ("api/read", "api/read api/write", None):
+            status, response = get_token(scope)
+            assert status == 200, response
+            jwt = response["access_token"]
+            payload = jwt.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            assert claims["iss"] == f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+            assert claims["token_use"] == "access"
+            assert claims["client_id"] == client["ClientId"]
+            assert set(claims["scope"].split()) == set((scope or "api/read api/write").split())
+            assert call(jwt)[:2] == (200, {"ok": True})
+        status, response = get_token("api/write")
+        assert status == 200, response
+        insufficient = response["access_token"]
+        for jwt in (insufficient, None):
+            status, body, headers = call(jwt)
+            assert (status, body) == (401, {"message": "Unauthorized"})
+            assert headers["x-amzn-errortype"] == "UnauthorizedException"
+        for scope, error in (("api/admin", "invalid_grant"), ("api/missing", "invalid_scope"),
+                             ("api/read api/admin", "invalid_grant"), ("api/read api/missing", "invalid_scope")):
+            status, response = get_token(scope)
+            assert status == 400, response
+            assert response["error"] == error
+            assert "access_token" not in response
+
+        # A scope failure must use UNAUTHORIZED, including a deployed override.
+        for kind, code in (("UNAUTHORIZED", "418"), ("ACCESS_DENIED", "419")):
+            apigw_v1.put_gateway_response(
+                restApiId=api_id, responseType=kind, statusCode=code,
+                responseTemplates={"application/json": '{"type":"' + kind + '"}'},
+            )
+        apigw_v1.create_deployment(restApiId=api_id, stageName="dev")
+        assert call(insufficient)[:2] == (418, {"type": "UNAUTHORIZED"})
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 

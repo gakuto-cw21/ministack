@@ -4742,9 +4742,23 @@ def test_oauth2_token_issues_no_id_token_without_openid():
     assert sorted(json.loads(body)) == ['access_token', 'expires_in', 'token_type']
 
 
+def _client_credentials_client(cognito_idp, allowed_scopes=None, identifier='api'):
+    pool_id = cognito_idp.create_user_pool(PoolName=f'm2m-{_uuid_mod.uuid4().hex[:8]}')['UserPool']['Id']
+    cognito_idp.create_resource_server(
+        UserPoolId=pool_id, Identifier=identifier, Name='api',
+        Scopes=[{'ScopeName': name, 'ScopeDescription': name} for name in ('read', 'write', 'admin')],
+    )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='m2m', GenerateSecret=True,
+        AllowedOAuthFlowsUserPoolClient=True, AllowedOAuthFlows=['client_credentials'],
+        AllowedOAuthScopes=allowed_scopes if allowed_scopes is not None else [f'{identifier}/read'],
+    )['UserPoolClient']
+    return pool_id, client
+
+
 def test_oauth2_token_client_credentials():
     cognito_idp = make_client('cognito-idp')
-    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
+    pool_id, client = _client_credentials_client(cognito_idp)
     client_id = client['ClientId']
     client_secret = client['ClientSecret']
 
@@ -4752,6 +4766,7 @@ def test_oauth2_token_client_credentials():
         'grant_type': 'client_credentials',
         'client_id': client_id,
         'client_secret': client_secret,
+        'scope': 'api/read',
     })
 
     assert status == 200
@@ -4765,7 +4780,7 @@ def test_oauth2_token_client_credentials():
 
 def test_oauth2_token_client_credentials_expires_with_the_client():
     cognito_idp = make_client('cognito-idp')
-    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
+    pool_id, client = _client_credentials_client(cognito_idp)
     cognito_idp.update_user_pool_client(
         UserPoolId=pool_id, ClientId=client['ClientId'],
         AccessTokenValidity=5, TokenValidityUnits={'AccessToken': 'minutes'},
@@ -4775,6 +4790,7 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
         'grant_type': 'client_credentials',
         'client_id': client['ClientId'],
         'client_secret': client['ClientSecret'],
+        'scope': 'api/read',
     })
 
     assert status == 200
@@ -4785,10 +4801,10 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
 
 @pytest.mark.parametrize('requested,scope', [
     (None, 'zeta/x api/write api/read'),
+    ('', 'zeta/x api/write api/read'),
     ('api/read', 'api/read'),
     ('api/read api/write zeta/x', 'zeta/x api/write api/read'),
     ('api/read api/read', 'api/read'),
-    ('api/read bogus/x', 'api/read'),
 ])
 def test_oauth2_token_client_credentials_carries_granted_scopes(requested, scope):
     """No scope parameter grants every scope the client allows."""
@@ -4831,12 +4847,117 @@ def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requeste
         'grant_type': 'client_credentials', 'client_id': client['ClientId'],
         'client_secret': client['ClientSecret'], 'scope': requested,
     })
-    assert (status, json.loads(body)) == (400, {'error': error})
+    assert status == 400, body
+    response = json.loads(body)
+    assert response['error'] == error
+    assert 'access_token' not in response
+
+
+@pytest.mark.parametrize('basic', [False, True])
+@pytest.mark.parametrize('requested,error', [
+    ('api/admin', 'invalid_grant'),
+    ('api/missing', 'invalid_scope'),
+    ('missing/read', 'invalid_scope'),
+    ('api/read api/admin', 'invalid_grant'),
+    ('api/read api/missing', 'invalid_scope'),
+    ('openid', 'invalid_scope'),
+    ('   ', 'invalid_scope'),
+])
+def test_oauth2_token_client_credentials_rejects_invalid_scopes(requested, error, basic):
+    """Official token endpoint docs: reject the entire invalid scope request."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _client_credentials_client(cognito_idp)
+    try:
+        form = {'grant_type': 'client_credentials', 'scope': requested}
+        headers = {}
+        if basic:
+            credentials = base64.b64encode(f"{client['ClientId']}:{client['ClientSecret']}".encode()).decode()
+            headers['Authorization'] = f'Basic {credentials}'
+        else:
+            form.update(client_id=client['ClientId'], client_secret=client['ClientSecret'])
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form, headers=headers)
+        response = json.loads(body)
+        assert status == 400, body
+        assert response['error'] == error
+        assert 'access_token' not in response
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_token_client_credentials_rejects_scope_with_no_client_permissions():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _client_credentials_client(cognito_idp, allowed_scopes=[])
+    try:
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+            'client_secret': client['ClientSecret'], 'scope': 'api/read',
+        })
+        assert status == 400, body
+        assert json.loads(body)['error'] == 'invalid_grant'
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+@pytest.mark.parametrize('requested', [None, ''])
+def test_oauth2_token_client_credentials_empty_permissions_never_grant_user_scope(requested):
+    """M2M cannot inherit a user sign-in scope from an empty configuration.
+
+    AWS does not document whether this configuration is rejected or gets a
+    scopeless token, so check the permission invariant without fixing a status.
+    """
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _client_credentials_client(cognito_idp, allowed_scopes=[])
+    try:
+        form = {'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+                'client_secret': client['ClientSecret']}
+        if requested is not None:
+            form['scope'] = requested
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form)
+        response = json.loads(body)
+        assert status in (200, 400), body
+        if status == 200:
+            assert _decode_jwt_claims(response['access_token']).get('scope', '') == ''
+        else:
+            assert 'error' in response
+            assert 'access_token' not in response
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_token_client_credentials_scope_definition_is_pool_scoped():
+    cognito_idp = make_client('cognito-idp')
+    other_pool, _ = _client_credentials_client(cognito_idp, identifier='other')
+    pool_id, client = _client_credentials_client(cognito_idp)
+    try:
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+            'client_secret': client['ClientSecret'], 'scope': 'other/read',
+        })
+        assert status == 400, body
+        assert json.loads(body)['error'] == 'invalid_scope'
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+        cognito_idp.delete_user_pool(UserPoolId=other_pool)
+
+
+def test_oauth2_token_client_credentials_accepts_url_resource_server_identifier():
+    cognito_idp = make_client('cognito-idp')
+    identifier = 'https://example.test/api/v1'
+    pool_id, client = _client_credentials_client(cognito_idp, identifier=identifier)
+    try:
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+            'client_secret': client['ClientSecret'], 'scope': f'{identifier}/read',
+        })
+        assert status == 200, body
+        assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == f'{identifier}/read'
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
 def test_oauth2_token_client_auth_basic():
     cognito_idp = make_client('cognito-idp')
-    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
+    pool_id, client = _client_credentials_client(cognito_idp)
     client_id = client['ClientId']
     client_secret = client['ClientSecret']
 
@@ -4846,6 +4967,7 @@ def test_oauth2_token_client_auth_basic():
         f'{ENDPOINT}/oauth2/token',
         {
             'grant_type': 'client_credentials',
+            'scope': 'api/read',
         },
         headers={'Authorization': f'Basic {basic}'},
     )
