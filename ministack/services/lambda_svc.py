@@ -44,8 +44,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 import zipfile
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -2767,6 +2769,46 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
     return 204, {}, b""
 
 
+# Code and configuration share a revision; each alias has its own. Only
+# registry lookup is global. Weak entries disappear once all active callers
+# release their strong references, without persisting locks in function state.
+_revision_locks = weakref.WeakValueDictionary()
+_revision_locks_guard = threading.Lock()
+
+
+def _serialized_revision_update(*, alias=False):
+    def decorate(operation):
+        @wraps(operation)
+        def guarded(*args, **kwargs):
+            name = args[0] if args else kwargs["func_name" if alias else "name"]
+            alias_name = (args[1] if len(args) > 1 else kwargs["alias_name"]) if alias else None
+            key = (get_account_id(), get_region(), name, alias_name)
+            with _revision_locks_guard:
+                lock = _revision_locks.get(key)
+                if lock is None:
+                    lock = threading.RLock()
+                    _revision_locks[key] = lock
+            # Keep this reference while waiting as well as while executing:
+            # a waiter must never acquire a replacement lock for the same key.
+            # Reentrant acquisition cannot deadlock a same-thread nested call.
+            with lock:
+                return operation(*args, **kwargs)
+        return guarded
+    return decorate
+
+
+def _check_revision(current: dict, data: dict):
+    if "RevisionId" in data and data["RevisionId"] != current.get("RevisionId"):
+        logger.debug("Rejected Lambda update with a stale RevisionId")
+        return error_response_json(
+            "PreconditionFailedException",
+            "The RevisionId provided does not match the latest RevisionId.",
+            412,
+        )
+    return None
+
+
+@_serialized_revision_update()
 def _update_code(name: str, data: dict):
     if name not in _functions:
         return error_response_json(
@@ -2775,6 +2817,9 @@ def _update_code(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    err = _check_revision(func["config"], data)
+    if err is not None:
+        return err
     code_zip = None
     # UpdateFunctionCode is where AWS lets the architecture change (the
     # UpdateFunctionConfiguration model has no Architectures member).
@@ -2859,6 +2904,7 @@ def _update_code(name: str, data: dict):
     return json_response(func["config"])
 
 
+@_serialized_revision_update()
 def _update_config(name: str, data: dict):
     if name not in _functions:
         return error_response_json(
@@ -2866,6 +2912,9 @@ def _update_config(name: str, data: dict):
             f"Function not found: {_func_arn(name)}",
             404,
         )
+    err = _check_revision(_functions[name]["config"], data)
+    if err is not None:
+        return err
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
@@ -4983,12 +5032,10 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
                 lines.append(_report())
         else:
             lines = [start, *(log_text.splitlines() if log_text else []), end, _report()]
-        for line in lines:
-            stream["events"].append({"timestamp": now_ms, "message": line, "ingestionTime": now_ms})
-        if stream["firstEventTimestamp"] is None:
-            stream["firstEventTimestamp"] = now_ms
-        stream["lastEventTimestamp"] = now_ms
-        stream["lastIngestionTime"] = now_ms
+        _cwl._append_log_events(stream, [
+            {"timestamp": now_ms, "message": line, "ingestionTime": now_ms}
+            for line in lines
+        ])
         # Forward to any subscription filters on this group (e.g. Lambda log
         # processor pattern), matching AWS (#896).
         _cwl._fanout_to_subscription_filters(
@@ -5973,6 +6020,7 @@ def _get_alias(func_name: str, alias_name: str):
     return json_response(alias)
 
 
+@_serialized_revision_update(alias=True)
 def _update_alias(func_name: str, alias_name: str, data: dict):
     if func_name not in _functions:
         return error_response_json(
@@ -5987,6 +6035,9 @@ def _update_alias(func_name: str, alias_name: str, data: dict):
             f"Alias not found: {_func_arn(func_name)}:{alias_name}",
             404,
         )
+    err = _check_revision(alias, data)
+    if err is not None:
+        return err
     for key in ("FunctionVersion", "Description"):
         if key in data:
             alias[key] = data[key]

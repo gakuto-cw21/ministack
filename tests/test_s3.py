@@ -9111,3 +9111,76 @@ def test_s3_copy_permission_contract(
             result = s3.get_object(Bucket=destination, Key="copied")
             with result["Body"] as body:
                 assert body.read() == b"auth-contract"
+
+
+@pytest.fixture
+def auth_s3_post_bucket(s3):
+    """A versioned bucket supporting lock fields, with complete version cleanup."""
+    bucket = f"auth-post-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+    try:
+        yield bucket
+    finally:
+        versions = s3.list_object_versions(Bucket=bucket)
+        for version in versions.get("Versions", []):
+            s3.put_object_legal_hold(Bucket=bucket, Key=version["Key"], LegalHold={"Status": "OFF"})
+            s3.delete_object(Bucket=bucket, Key=version["Key"], VersionId=version["VersionId"])
+        for marker in versions.get("DeleteMarkers", []):
+            s3.delete_object(Bucket=bucket, Key=marker["Key"], VersionId=marker["VersionId"])
+        s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission,field,value,extra_action", [
+    ("none", None, None, None),
+    ("allow", None, None, None),
+    ("explicit-deny", None, None, None),
+    ("other-resource", None, None, None),
+] + [
+    (permission, field, value, action)
+    for permission in ("missing-extra", "allow")
+    for field, value, action in (
+        ("acl", "private", "s3:PutObjectAcl"),
+        ("x-amz-tagging", "purpose=test", "s3:PutObjectTagging"),
+        ("x-amz-object-lock-legal-hold", "ON", "s3:PutObjectLegalHold"),
+        ("x-amz-object-lock-mode", "GOVERNANCE", "s3:PutObjectRetention"),
+    )
+])
+def test_s3_post_permission_contract(
+    auth_enabled, iam_user, s3, auth_s3_post_bucket, permission, field, value, extra_action,
+):
+    """Multipart credentials identify the signer, including optional write actions."""
+    from xml.etree import ElementTree
+
+    import requests
+
+    destination = auth_s3_post_bucket
+    resource = f"arn:aws:s3:::{destination}/copied"
+    statements = []
+    if permission != "none":
+        actions = ["s3:PutObject"]
+        if extra_action and permission == "allow":
+            actions.append(extra_action)
+        statements.append({"Effect": "Allow", "Action": actions,
+                           "Resource": resource + "-other" if permission == "other-resource" else resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "s3:PutObject", "Resource": resource})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client(
+        "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    fields = {field: value} if field else {}
+    form = client.generate_presigned_post(
+        Bucket=destination, Key="copied", Fields=fields,
+        Conditions=[{field: value}] if field else [],
+    )
+    response = requests.post(form["url"], data=form["fields"],
+                             files={"file": ("contract.txt", b"post-auth-contract")}, timeout=10)
+    if auth_enabled and permission != "allow":
+        assert response.status_code == 403, response.text
+        assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
+        assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+    else:
+        assert response.status_code == 204, response.text
+        with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
+            assert body.read() == b"post-auth-contract"

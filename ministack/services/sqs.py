@@ -940,11 +940,17 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:SetQueueAttributes")
     incoming = data.get("Attributes") or {}
-    if "RedrivePolicy" in incoming:
+    if "RedrivePolicy" in incoming and incoming["RedrivePolicy"] != "":
         _validate_redrive_policy(str(incoming["RedrivePolicy"]))
     _validate_numeric_attrs(incoming)
     for k, v in incoming.items():
-        q["attributes"][k] = str(v)
+        if k in {"Policy", "RedrivePolicy", "RedriveAllowPolicy"} and v == "":
+            # Terraform deletes standalone policy resources with an empty
+            # attribute value. Reads must then omit the removed attribute.
+            q["attributes"].pop(k, None)
+            logger.debug("Removed queue attribute %s from %s", k, url)
+        else:
+            q["attributes"][k] = str(v)
     q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
     return {}
 
